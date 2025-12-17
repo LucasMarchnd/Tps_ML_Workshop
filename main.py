@@ -5,12 +5,19 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+import torch.nn.functional as F
 
 from ml_utils.data import load_dataset, get_array_from_path, LandCoverData, LandCoverDataset
 from ml_utils.viz import visualize_sample, show_image, show_mask
-from ml_utils.model import SimpleUNet
+from ml_utils.model import SimpleUNet, kl_divergence
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
+# Conseils :
+# Faire des statistiques sur les images classes déséquilibrées 
+# Faire un subset des classes sympas avec les classes
+# Faire des augmentations de données (rotations, flips, etc.)
+# Regrouper des classes classe végétales similaires
+# Je crois que seulement 7/10 sont bcp utilisées,les classes : snow cloud et no_data sont peu utilisées
 
 def predict_and_visualize(model, dataset, device, num_samples=3):
     """
@@ -100,6 +107,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     """
     print("Début de l'entraînement...")
     
+    # Ajout d'un scheduler pour ajuster le learning rate
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    
     for epoch in range(num_epochs):
         model.train() # Met le modèle en mode entraînement
         running_loss = 0.0
@@ -144,8 +154,47 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         
         print(f'Epoch {epoch+1}/{num_epochs} - Train Loss: {epoch_loss:.4f} - Val Loss: {val_loss:.4f}')
         
+        # Mise à jour du learning rate
+        scheduler.step()
+        
     print("Entraînement terminé !")
     return model
+
+def evaluate_kl_divergence(model, data_loader, device):
+    """
+    Calcule la KL Divergence moyenne par pixel sur un jeu de données.
+    """
+    print("Calcul de la KL Divergence...")
+    model.eval()
+    total_kl_div = 0.0
+    total_pixels = 0
+
+    with torch.no_grad():
+        for images, masks in data_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            # Obtenir les logits du modèle
+            predicted_logits = model(images)
+
+            # Convertir les masques d'indices en one-hot
+            # masks shape: (N, H, W) -> one-hot: (N, C, H, W)
+            true_labels_one_hot = F.one_hot(masks, num_classes=LandCoverData.N_CLASSES).permute(0, 3, 1, 2).float()
+
+            # Calculer la KL Divergence pour le batch (somme sur tous les éléments)
+            kl_div = kl_divergence(predicted_logits, true_labels_one_hot, reduction='sum')
+            
+            total_kl_div += kl_div.item()
+            
+            # Compter le nombre total de pixels (N * H * W)
+            total_pixels += masks.nelement()
+
+    # Calculer la moyenne par pixel
+    # La réduction 'sum' somme sur tous les éléments (batch, classes, hauteur, largeur).
+    # Avec une cible one-hot, la KL divergence est équivalente à la cross-entropy.
+    # On divise par le nombre total de pixels pour obtenir la cross-entropy moyenne par pixel.
+    avg_kl_div = total_kl_div / total_pixels if total_pixels > 0 else 0
+    return avg_kl_div
 
 def main():
     # Define paths
@@ -170,8 +219,8 @@ def main():
     
     # On utilise un sous-ensemble pour l'exemple (limit=100) pour que ça tourne vite
     # Pour tout le dataset, enlevez le slicing [:100]
-    subset_size = 1000
-    full_dataset = LandCoverDataset(train_images_paths[:subset_size], train_masks_paths[:subset_size])
+    # subset_size = 1000 # Utilisation du jeu de données complet
+    full_dataset = LandCoverDataset(train_images_paths, train_masks_paths)
     
     # Séparation Train / Validation (80% / 20%)
     train_size = int(0.8 * len(full_dataset))
@@ -191,7 +240,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Utilisation du device: {device}")
     
-    model = SimpleUNet(in_channels=LandCoverData.N_CHANNELS, out_channels=LandCoverData.N_CLASSES)
+    model = SimpleUNet(in_channels=LandCoverData.N_CHANNELS, out_channels=LandCoverData.N_CLASSES, base_filters=32)
     model = model.to(device)
     
     MODEL_PATH = 'simple_unet_model.pth'
@@ -211,11 +260,17 @@ def main():
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         
         # Lancement de l'entraînement
-        model = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=80, device=device)
+        # Réduction du nombre d'époques à 10 pour un test rapide. 
+        # Augmentez cette valeur pour un entraînement complet.
+        model = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10, device=device)
         
         # Sauvegarde du modèle
         torch.save(model.state_dict(), MODEL_PATH)
         print(f"Modèle sauvegardé sous '{MODEL_PATH}'")
+
+    # Calcul et affichage de la KL Divergence sur le jeu de validation
+    # avg_kl_div = evaluate_kl_divergence(model, val_loader, device)
+    # print(f"KL Divergence moyenne sur le jeu de validation: {avg_kl_div:.4f}")
 
     # Visualisation des résultats
     print("Visualisation sur le jeu de validation (avec vérité terrain) :")

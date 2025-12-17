@@ -78,3 +78,32 @@ class SimpleUNet(nn.Module):
         d1 = self.dec1(d1)
         
         return self.final(d1)
+
+def kl_divergence(p_logits, q_labels, reduction='batchmean'):
+    """
+    Calculates the Kullback-Leibler Divergence between two probability distributions.
+
+    Args:
+        p_logits (torch.Tensor): Logits from the model (predicted distribution).
+                                 Shape: (N, C, H, W)
+        q_labels (torch.Tensor): True labels, typically one-hot encoded.
+                                 Shape: (N, C, H, W)
+        reduction (str): Specifies the reduction to apply to the output:
+                         'none' | 'batchmean' | 'sum' | 'mean'. 'batchmean' is the default
+                         which is the sum divided by the batch size.
+
+    Returns:
+        torch.Tensor: The KL divergence.
+    """
+    # Apply log_softmax to the predicted logits to get log-probabilities
+    p_log_softmax = F.log_softmax(p_logits, dim=1)
+
+    # Ensure q_labels are probabilities (e.g., one-hot encoded)
+    # If q_labels are class indices, they need to be converted to one-hot first.
+    # Assuming q_labels are already one-hot encoded probabilities here.
+
+    # F.kl_div expects log-probabilities for the input (p) and probabilities for the target (q)
+    # The formula for KL divergence is sum(q * log(q / p))
+    # F.kl_div computes sum(q * (log(q) - p_log_softmax))
+    # So, if q is the target distribution and p_log_softmax is log(p), this is correct.
+    return F.kl_div(p_log_softmax, q_labels, reduction=reduction)
