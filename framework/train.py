@@ -10,11 +10,24 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-from framework.dataset import LandCoverData as LCD
-from framework.dataset import parse_image, load_image_train, load_image_test
-from framework.model import UNet
-from framework.tensorflow_utils import plot_predictions
-from framework.utils import YamlNamespace
+from dataset import LandCoverData as LCD
+from dataset import parse_image, load_image_train, load_image_test
+from model import UNet
+from tensorflow_utils import plot_predictions
+from utils import YamlNamespace
+
+
+
+def shift_labels(image, mask):
+    shift_condition = tf.greater_equal(mask, 2)
+    
+    shifted_mask = mask - 2
+
+    new_mask = tf.where(shift_condition, shifted_mask, tf.zeros_like(mask))
+    return image, new_mask
+
+
+
 
 class PlotCallback(tf.keras.callbacks.Callback):
     """A callback used to display sample predictions during training."""
@@ -105,6 +118,9 @@ if __name__ == '__main__':
         .batch(config.batch_size)\
         .prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
 
+
+    train_dataset = train_dataset.map(shift_labels, num_parallel_calls=tf.data.AUTOTUNE)
+
     val_dataset = val_dataset.map(load_image_test, num_parallel_calls=N_CPUS)\
         .repeat()\
         .batch(config.batch_size)\
@@ -131,7 +147,7 @@ if __name__ == '__main__':
         ),
         # tf.keras.callbacks.EarlyStopping(patience=10, verbose=1),
         tf.keras.callbacks.ModelCheckpoint(
-            filepath=xp_dir/'checkpoints/epoch{epoch}', save_best_only=False, verbose=1
+            filepath=xp_dir/'checkpoints/epoch{epoch}.keras', save_best_only=False, verbose=1
         ),
         tf.keras.callbacks.CSVLogger(
             filename=(xp_dir/'fit_logs.csv')
@@ -153,7 +169,7 @@ if __name__ == '__main__':
     print(model.summary())
 
     # get optimizer, loss, and compile model for training
-    optimizer = tf.keras.optimizers.Adam(lr=config.lr)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=config.lr)
 
     # compute class weights for the loss: inverse-frequency balanced
     # note: we set to 0 the weights for the classes "no_data"(0) and "clouds"(1) to ignore these
@@ -161,21 +177,29 @@ if __name__ == '__main__':
     class_weight[LCD.IGNORED_CLASSES_IDX] = 0.
     print(f"Will use class weights: {class_weight}")
 
+     # Convertir le tableau NumPy en dictionnaire
+    class_weight_dict = {
+        i: class_weight[i] 
+        for i in range(len(class_weight))
+    }
+    for idx in LCD.IGNORED_CLASSES_IDX:
+        class_weight_dict[idx] = 0.
+
+
     loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False)
     print("Compile model")
     model.compile(optimizer=optimizer,
                   loss=loss,
-                  metrics=[])
+                  metrics=['accuracy'])
                   # metrics = [tf.keras.metrics.Precision(),
                   #            tf.keras.metrics.Recall(),
                   #            tf.keras.metrics.MeanIoU(num_classes=LCD.N_CLASSES)]) # TODO segmentation metrics
 
     # Launch training
-    model_history = model.fit(train_dataset, epochs=config.epochs,
-                              callbacks=callbacks,
-                              steps_per_epoch=trainset_size // config.batch_size,
-                              validation_data=val_dataset,
-                              validation_steps=valset_size // config.batch_size,
-                              class_weight=class_weight
-                              )
+    model_history = model.fit(
+        train_dataset, 
+        epochs=config.epochs,
+        callbacks=callbacks,
+        class_weight=class_weight_dict  # Utiliser le Dictionnaire ici
+)
 
