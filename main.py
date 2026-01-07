@@ -3,125 +3,66 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 
-from ml_utils.data import load_dataset, get_array_from_path, LandCoverData, LandCoverDataset
-from ml_utils.viz import visualize_sample, show_image, show_mask
-from ml_utils.model import SimpleUNet
+from ml_utils.data import LandCoverData, LandCoverDataset
+from ml_utils.viz import visualize_sample, show_image
+# Import des nouveaux modèles
+from ml_utils.model import SimpleUNet, GlobalPredictor, CombinedModel
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
 
-def predict_and_visualize(model, dataset, device, num_samples=3):
+# --- NOUVELLE FONCTION UTILITAIRE ---
+def get_distribution_from_mask(masks, n_classes):
     """
-    Fait des prédictions sur quelques images et les affiche avec un slider de transparence.
-    """
-    print(f"Visualisation de {num_samples} prédictions...")
-    model.eval() # Mode évaluation
-    
-    # Handle dataset size smaller than num_samples
-    if len(dataset) < num_samples:
-        indices = range(len(dataset))
-    else:
-        indices = random.sample(range(len(dataset)), num_samples)
-    
-    for idx in indices:
-        sample = dataset[idx]
-        if isinstance(sample, tuple):
-            image, mask = sample
-            has_mask = True
-        else:
-            image = sample
-            mask = None
-            has_mask = False
-        
-        # Préparation pour le modèle (ajout dimension batch)
-        input_tensor = image.unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            output = model(input_tensor)
-            # output est (1, N_CLASSES, H, W)
-            pred_mask = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()
-            
-        # Préparation pour l'affichage
-        # Image: (C, H, W) -> (H, W, C) et conversion numpy uint16 pour show_image
-        img_display = image.permute(1, 2, 0).numpy().astype(np.uint16)
-        
-        # Prepare color mask
-        classes_colorpalette = {c: color/255. for (c, color) in LandCoverData.CLASSES_COLORPALETTE.items()}
-        color_mask = np.zeros((*pred_mask.shape, 3))
-        for c, color in classes_colorpalette.items():
-            color_mask[pred_mask == c] = color
-
-        # Setup plot
-        fig, ax = plt.subplots(figsize=(10, 8))
-        plt.subplots_adjust(bottom=0.25)
-        
-        # Show original image
-        show_image(img_display, display_min=0, display_max=2200, ax=ax)
-        ax.set_title(f"Prédiction (Sample {idx})")
-        
-        # Show prediction overlay
-        initial_alpha = 0.5
-        mask_im = ax.imshow(color_mask, alpha=initial_alpha)
-        
-        # Slider
-        ax_slider = plt.axes([0.25, 0.1, 0.65, 0.03], facecolor='lightgoldenrodyellow')
-        slider = Slider(ax_slider, 'Opacité', 0.0, 1.0, valinit=initial_alpha)
-        
-        def update(val):
-            mask_im.set_alpha(slider.val)
-            fig.canvas.draw_idle()
-            
-        slider.on_changed(update)
-        
-        # Add legend
-        import matplotlib.patches as mpatches
-        handles = []
-        for c, color in classes_colorpalette.items():
-            handles.append(mpatches.Patch(color=color, label=LandCoverData.CLASSES[c]))
-        ax.legend(handles=handles, loc='upper right', bbox_to_anchor=(1.3, 1))
-        
-        print(f"Affichage de l'image {idx}. Fermez la fenêtre pour passer à la suivante.")
-        plt.show()
-
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20, device='cpu'):
-    """
-    Fonction d'entraînement du modèle.
+    Calcule la distribution de classes pour un batch de masques.
     
     Args:
-        model: Le modèle PyTorch à entraîner
-        train_loader: DataLoader pour les données d'entraînement
-        val_loader: DataLoader pour les données de validation
-        criterion: Fonction de perte (Loss function)
-        optimizer: Optimiseur (ex: Adam)
-        num_epochs: Nombre d'époques
-        device: 'cuda' ou 'cpu'
+        masks (Tensor): Batch de masques de segmentation (B, H, W).
+        n_classes (int): Nombre de classes.
+        
+    Returns:
+        Tensor: Batch de distributions (B, n_classes).
     """
-    print("Début de l'entraînement...")
+    B, H, W = masks.shape
+    distributions = torch.zeros((B, n_classes), device=masks.device)
+    for i in range(B):
+        # bincount est très efficace pour compter les occurrences
+        counts = torch.bincount(masks[i].flatten(), minlength=n_classes)
+        distributions[i] = counts.float() / (H * W)
+    return distributions
+
+# --- FONCTION D'ENTRAÎNEMENT MODIFIÉE ---
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20, device='cpu', n_classes=10):
+    """
+    Fonction d'entraînement adaptée pour le CombinedModel qui prédit une distribution.
+    """
+    print("Début de l'entraînement du modèle combiné...")
     
     for epoch in range(num_epochs):
-        model.train() # Met le modèle en mode entraînement
+        model.train()
         running_loss = 0.0
         
-        # Boucle sur les batches d'entraînement
         for images, masks in train_loader:
             images = images.to(device)
             masks = masks.to(device)
             
-            # 1. Remise à zéro des gradients
+            # Calculer la distribution de vérité terrain à partir des masques
+            target_dists = get_distribution_from_mask(masks, n_classes).to(device)
+            
             optimizer.zero_grad()
             
-            # 2. Passage avant (Forward pass)
-            outputs = model(images)
+            # Le modèle retourne les logits de la distribution finale
+            output_logits = model(images)
             
-            # 3. Calcul de la perte
-            loss = criterion(outputs, masks)
+            # Appliquer le log_softmax car KLDivLoss attend des log-probabilités en entrée
+            output_log_probs = F.log_softmax(output_logits, dim=1)
             
-            # 4. Rétropropagation (Backward pass)
+            # Calcul de la perte entre la log-distribution prédite et la distribution cible
+            loss = criterion(output_log_probs, target_dists)
+            
             loss.backward()
-            
-            # 5. Mise à jour des poids
             optimizer.step()
             
             running_loss += loss.item() * images.size(0)
@@ -129,15 +70,19 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         epoch_loss = running_loss / len(train_loader.dataset)
         
         # Validation
-        model.eval() # Met le modèle en mode évaluation
+        model.eval()
         val_loss = 0.0
-        with torch.no_grad(): # Pas de calcul de gradient pour la validation
+        with torch.no_grad():
             for images, masks in val_loader:
                 images = images.to(device)
                 masks = masks.to(device)
                 
-                outputs = model(images)
-                loss = criterion(outputs, masks)
+                target_dists = get_distribution_from_mask(masks, n_classes).to(device)
+                
+                output_logits = model(images)
+                output_log_probs = F.log_softmax(output_logits, dim=1)
+                
+                loss = criterion(output_log_probs, target_dists)
                 val_loss += loss.item() * images.size(0)
                 
         val_loss = val_loss / len(val_loader.dataset)
@@ -148,86 +93,111 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     return model
 
 def main():
-    # Define paths
-    DATA_FOLDER = Path('./dataset/').expanduser()
+    DATA_FOLDER = Path('/Users/alice/Documents/Cours/TPS/ML_Workshop/dataset/').expanduser()
     
     train_images_paths = sorted(list(DATA_FOLDER.glob('train/images/*.tif')))
     train_masks_paths = sorted(list(DATA_FOLDER.glob('train/masks/*.tif')))
-    test_images_paths = sorted(list(DATA_FOLDER.glob('test/images/*.tif')))
-
+    
     print(f'Number of train images: {len(train_images_paths)}')
     print(f'Number of train masks: {len(train_masks_paths)}')
-    print(f'Number of test images: {len(test_images_paths)}')
 
-    # Visualize a random sample to check data integrity
-    if len(train_images_paths) > 0:
-        idx = random.choice(range(len(train_images_paths)))
-        visualize_sample(train_images_paths[idx], train_masks_paths[idx])
+    # --- NOUVELLE VÉRIFICATION ---
+    if not train_images_paths or not train_masks_paths:
+        print("\nERREUR: Aucune image ou masque d'entraînement n'a été trouvé.")
+        print("Veuillez vérifier que le dossier './dataset/train/' contient bien vos images et masques.")
+        return # Quitte la fonction main
 
-    # Load data for Machine Learning
-    # Utilisation de notre Dataset personnalisé pour charger les données efficacement
+    # if len(train_images_paths) > 0:
+    #     idx = random.choice(range(len(train_images_paths)))
+    #     visualize_sample(train_images_paths[idx], train_masks_paths[idx])
+
     print("Préparation des données...")
-    
-    # On utilise un sous-ensemble pour l'exemple (limit=100) pour que ça tourne vite
-    # Pour tout le dataset, enlevez le slicing [:100]
     subset_size = 1000
     full_dataset = LandCoverDataset(train_images_paths[:subset_size], train_masks_paths[:subset_size])
     
-    # Séparation Train / Validation (80% / 20%)
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     
-    # Création des DataLoaders
-    # batch_size: nombre d'images traitées en même temps
-    # shuffle=True: mélange les données à chaque époque (important pour l'entraînement)
     BATCH_SIZE = 8
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     print(f"Données prêtes: {len(train_dataset)} images d'entraînement, {len(val_dataset)} images de validation.")
 
-    # Initialisation du modèle
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Utilisation du device: {device}")
     
-    model = SimpleUNet(in_channels=LandCoverData.N_CHANNELS, out_channels=LandCoverData.N_CLASSES)
+    # --- INITIALISATION DES MODÈLES ---
+    # 1. Charger le U-Net (peut être pré-entraîné si vous le souhaitez)
+    unet_model = SimpleUNet(in_channels=LandCoverData.N_CHANNELS, out_channels=LandCoverData.N_CLASSES)
+    # Optionnel: Charger les poids si vous avez déjà un U-Net entraîné
+    # unet_model.load_state_dict(torch.load('path_to_your_unet.pth'))
+
+    # 2. Créer le prédicteur global
+    global_predictor = GlobalPredictor(in_channels=LandCoverData.N_CHANNELS, out_features=LandCoverData.N_CLASSES)
+    
+    # 3. Créer le modèle combiné
+    model = CombinedModel(unet=unet_model, global_predictor=global_predictor, n_classes=LandCoverData.N_CLASSES)
     model = model.to(device)
     
-    MODEL_PATH = 'simple_unet_model.pth'
+    MODEL_PATH = 'combined_model.pth'
     
     if Path(MODEL_PATH).exists():
         print(f"Modèle trouvé à '{MODEL_PATH}'. Chargement du modèle existant...")
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        
+        # --- ÉVALUATION DU MODÈLE ---
+        print("\nDébut de l'évaluation du modèle sur le jeu de validation...")
+        evaluate_model(model, val_loader, device=device, n_classes=LandCoverData.N_CLASSES)
+        
     else:
         print("Aucun modèle trouvé. Démarrage de l'entraînement...")
         
-        # Définition de la Loss et de l'Optimizer
-        # CrossEntropyLoss est standard pour la segmentation multi-classes
-        criterion = nn.CrossEntropyLoss()
-        
-        # Adam est un optimiseur très performant et standard
-        # lr (learning rate) contrôle la vitesse d'apprentissage
+        criterion = nn.KLDivLoss(reduction='batchmean')
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         
-        # Lancement de l'entraînement
-        model = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=80, device=device)
+        model = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=80, device=device, n_classes=LandCoverData.N_CLASSES)
         
-        # Sauvegarde du modèle
         torch.save(model.state_dict(), MODEL_PATH)
         print(f"Modèle sauvegardé sous '{MODEL_PATH}'")
 
-    # Visualisation des résultats
-    print("Visualisation sur le jeu de validation (avec vérité terrain) :")
-    predict_and_visualize(model, val_dataset, device)
+    print("Script terminé.")
 
-    # Visualisation sur le jeu de test (sans vérité terrain)
-    if len(test_images_paths) > 0:
-        print("Visualisation sur le jeu de test (sans vérité terrain) :")
-        test_dataset = LandCoverDataset(test_images_paths)
-        predict_and_visualize(model, test_dataset, device, num_samples=10)
+# --- NOUVELLE FONCTION D'ÉVALUATION ---
+def evaluate_model(model, data_loader, device, n_classes):
+    """
+    Évalue le modèle sur un jeu de données et affiche la perte de divergence KL moyenne.
+    """
+    model.eval() # Mode évaluation
+    total_kl_div = 0.0
+    criterion = nn.KLDivLoss(reduction='sum') # 'sum' pour un contrôle plus fin
 
+    with torch.no_grad():
+        for images, masks in data_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            # Calculer la distribution de vérité terrain
+            target_dists = get_distribution_from_mask(masks, n_classes).to(device)
+            
+            # Prédiction du modèle
+            output_logits = model(images)
+            output_log_probs = F.log_softmax(output_logits, dim=1)
+            
+            # Calcul de la divergence KL pour le batch
+            # Note: KL(P||Q) = sum(P * log(P/Q))
+            # PyTorch's KLDivLoss calcule sum(Q * (log(Q) - P)) où P est l'input (log-probs) et Q est la target (probs)
+            # Pour avoir la vraie KL divergence, il faut que l'input soit log(pred) et target soit gt
+            kl_div = criterion(output_log_probs, target_dists)
+            total_kl_div += kl_div.item()
 
+    # Calcul de la moyenne
+    avg_kl_div = total_kl_div / len(data_loader.dataset)
+    print(f"\n--- Performance du Modèle ---")
+    print(f"Divergence de Kullback-Leibler (KL) moyenne par échantillon: {avg_kl_div:.6f}")
+    print("----------------------------")
+    print("(Plus cette valeur est proche de 0, meilleure est la performance)")
 
 if __name__ == "__main__":
     main()
