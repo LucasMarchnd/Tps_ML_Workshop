@@ -12,6 +12,8 @@ from ml_utils.viz import visualize_sample, show_image, show_mask
 from ml_utils.model import SimpleUNet, kl_divergence
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
+import os
+
 # Conseils :
 # Faire des statistiques sur les images classes déséquilibrées 
 # Faire un subset des classes sympas avec les classes
@@ -20,13 +22,9 @@ from matplotlib.widgets import Slider
 # Je crois que seulement 7/10 sont bcp utilisées,les classes : snow cloud et no_data sont peu utilisées
 
 def predict_and_visualize(model, dataset, device, num_samples=3):
-    """
-    Fait des prédictions sur quelques images et les affiche avec un slider de transparence.
-    """
     print(f"Visualisation de {num_samples} prédictions...")
-    model.eval() # Mode évaluation
+    model.eval()
     
-    # Handle dataset size smaller than num_samples
     if len(dataset) < num_samples:
         indices = range(len(dataset))
     else:
@@ -42,37 +40,32 @@ def predict_and_visualize(model, dataset, device, num_samples=3):
             mask = None
             has_mask = False
         
-        # Préparation pour le modèle (ajout dimension batch)
         input_tensor = image.unsqueeze(0).to(device)
         
         with torch.no_grad():
             output = model(input_tensor)
-            # output est (1, N_CLASSES, H, W)
             pred_mask = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()
             
-        # Préparation pour l'affichage
-        # Image: (C, H, W) -> (H, W, C) et conversion numpy uint16 pour show_image
-        img_display = image.permute(1, 2, 0).numpy().astype(np.uint16)
+        img_display = image.permute(1, 2, 0).numpy().astype(np.float32)
+        # Re-scale for display if it was normalized to 0-1
+        # Visualization expects distinct colors, but here we just show the image
         
-        # Prepare color mask
         classes_colorpalette = {c: color/255. for (c, color) in LandCoverData.CLASSES_COLORPALETTE.items()}
         color_mask = np.zeros((*pred_mask.shape, 3))
         for c, color in classes_colorpalette.items():
             color_mask[pred_mask == c] = color
 
-        # Setup plot
         fig, ax = plt.subplots(figsize=(10, 8))
         plt.subplots_adjust(bottom=0.25)
         
-        # Show original image
-        show_image(img_display, display_min=0, display_max=2200, ax=ax)
+        # Display expects [0, 1] floats or [0, 255] ints. 
+        # Our images are now [0, 1] float32.
+        show_image(img_display, display_min=0, display_max=1, ax=ax)
         ax.set_title(f"Prédiction (Sample {idx})")
         
-        # Show prediction overlay
         initial_alpha = 0.5
         mask_im = ax.imshow(color_mask, alpha=initial_alpha)
         
-        # Slider
         ax_slider = plt.axes([0.25, 0.1, 0.65, 0.03], facecolor='lightgoldenrodyellow')
         slider = Slider(ax_slider, 'Opacité', 0.0, 1.0, valinit=initial_alpha)
         
@@ -82,7 +75,6 @@ def predict_and_visualize(model, dataset, device, num_samples=3):
             
         slider.on_changed(update)
         
-        # Add legend
         import matplotlib.patches as mpatches
         handles = []
         for c, color in classes_colorpalette.items():
@@ -93,55 +85,48 @@ def predict_and_visualize(model, dataset, device, num_samples=3):
         plt.show()
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20, device='cpu'):
-    """
-    Fonction d'entraînement du modèle.
-    
-    Args:
-        model: Le modèle PyTorch à entraîner
-        train_loader: DataLoader pour les données d'entraînement
-        val_loader: DataLoader pour les données de validation
-        criterion: Fonction de perte (Loss function)
-        optimizer: Optimiseur (ex: Adam)
-        num_epochs: Nombre d'époques
-        device: 'cuda' ou 'cpu'
-    """
     print("Début de l'entraînement...")
     
-    # Ajout d'un scheduler pour ajuster le learning rate
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
     
     for epoch in range(num_epochs):
-        model.train() # Met le modèle en mode entraînement
+        model.train()
         running_loss = 0.0
         
-        # Boucle sur les batches d'entraînement
         for images, masks in train_loader:
+            if torch.isnan(images).any() or torch.isinf(images).any():
+                print("Warning: NaN or Inf found in inputs. Skipping batch.")
+                continue
+                
             images = images.to(device)
             masks = masks.to(device)
             
-            # 1. Remise à zéro des gradients
             optimizer.zero_grad()
             
-            # 2. Passage avant (Forward pass)
             outputs = model(images)
             
-            # 3. Calcul de la perte
             loss = criterion(outputs, masks)
             
-            # 4. Rétropropagation (Backward pass)
             loss.backward()
             
-            # 5. Mise à jour des poids
+            # Gradient clipping pour eviter l'explosion du gradient (essentiel avec des poids eleves)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            
             optimizer.step()
             
             running_loss += loss.item() * images.size(0)
             
         epoch_loss = running_loss / len(train_loader.dataset)
         
-        # Validation
-        model.eval() # Met le modèle en mode évaluation
+        # Validation Phase
+        model.eval()
         val_loss = 0.0
-        with torch.no_grad(): # Pas de calcul de gradient pour la validation
+        
+        # IoU stats
+        total_intersections = np.zeros(LandCoverData.N_CLASSES)
+        total_unions = np.zeros(LandCoverData.N_CLASSES)
+        
+        with torch.no_grad():
             for images, masks in val_loader:
                 images = images.to(device)
                 masks = masks.to(device)
@@ -150,11 +135,46 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 loss = criterion(outputs, masks)
                 val_loss += loss.item() * images.size(0)
                 
+                # IoU Calculation
+                preds = torch.argmax(outputs, dim=1)
+                
+                for cls in range(LandCoverData.N_CLASSES):
+                    if cls in LandCoverData.IGNORED_CLASSES_IDX:
+                        continue
+                        
+                    pred_inds = (preds == cls)
+                    target_inds = (masks == cls)
+                    
+                    intersection = (pred_inds & target_inds).sum().item()
+                    union = (pred_inds | target_inds).sum().item()
+                    
+                    total_intersections[cls] += intersection
+                    total_unions[cls] += union
+                
         val_loss = val_loss / len(val_loader.dataset)
         
-        print(f'Epoch {epoch+1}/{num_epochs} - Train Loss: {epoch_loss:.4f} - Val Loss: {val_loss:.4f}')
+        # Compute IoU per class and Mean IoU
+        ious = []
+        valid_classes_iou = []
+        for cls in range(LandCoverData.N_CLASSES):
+            if cls in LandCoverData.IGNORED_CLASSES_IDX:
+                ious.append(np.nan)
+                continue
+                
+            if total_unions[cls] == 0:
+                iou = np.nan # Class not present in this epoch's validation set
+            else:
+                iou = total_intersections[cls] / total_unions[cls]
+                valid_classes_iou.append(iou)
+            ious.append(iou)
+            
+        mean_iou = np.nanmean(valid_classes_iou)
         
-        # Mise à jour du learning rate
+        print(f'Epoch {epoch+1}/{num_epochs} - Train Loss: {epoch_loss:.4f} - Val Loss: {val_loss:.4f} - mIoU: {mean_iou:.4f}')
+        
+        # Optional: Print IoU for specific interesting classes
+        print(f"  > IoU Snow: {ious[8]:.4f} | IoU Water: {ious[9]:.4f} | IoU Artificial: {ious[2]:.4f}")
+        
         scheduler.step()
         
     print("Entraînement terminé !")
@@ -174,30 +194,23 @@ def evaluate_kl_divergence(model, data_loader, device):
             images = images.to(device)
             masks = masks.to(device)
 
-            # Obtenir les logits du modèle
             predicted_logits = model(images)
 
-            # Convertir les masques d'indices en one-hot
-            # masks shape: (N, H, W) -> one-hot: (N, C, H, W)
             true_labels_one_hot = F.one_hot(masks, num_classes=LandCoverData.N_CLASSES).permute(0, 3, 1, 2).float()
 
-            # Calculer la KL Divergence pour le batch (somme sur tous les éléments)
             kl_div = kl_divergence(predicted_logits, true_labels_one_hot, reduction='sum')
             
             total_kl_div += kl_div.item()
             
-            # Compter le nombre total de pixels (N * H * W)
             total_pixels += masks.nelement()
 
-    # Calculer la moyenne par pixel
-    # La réduction 'sum' somme sur tous les éléments (batch, classes, hauteur, largeur).
-    # Avec une cible one-hot, la KL divergence est équivalente à la cross-entropy.
-    # On divise par le nombre total de pixels pour obtenir la cross-entropy moyenne par pixel.
     avg_kl_div = total_kl_div / total_pixels if total_pixels > 0 else 0
     return avg_kl_div
 
 def main():
-    # Define paths
+    # Enable blocking launch for better debug on CUDA errors
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    
     DATA_FOLDER = Path('./dataset/').expanduser()
     
     train_images_paths = sorted(list(DATA_FOLDER.glob('train/images/*.tif')))
@@ -208,35 +221,36 @@ def main():
     print(f'Number of train masks: {len(train_masks_paths)}')
     print(f'Number of test images: {len(test_images_paths)}')
 
-    # Visualize a random sample to check data integrity
     if len(train_images_paths) > 0:
         idx = random.choice(range(len(train_images_paths)))
         visualize_sample(train_images_paths[idx], train_masks_paths[idx])
 
-    # Load data for Machine Learning
-    # Utilisation de notre Dataset personnalisé pour charger les données efficacement
     print("Préparation des données...")
     
-    # On utilise un sous-ensemble pour l'exemple (limit=100) pour que ça tourne vite
-    # Pour tout le dataset, enlevez le slicing [:100]
-    # subset_size = 1000 # Utilisation du jeu de données complet
-    full_dataset = LandCoverDataset(train_images_paths, train_masks_paths)
+    # Separation manuelle des chemins pour train et val afin d'appliquer l'augmentation uniquement sur le train
+    indices = list(range(len(train_images_paths)))
+    random.shuffle(indices)
     
-    # Séparation Train / Validation (80% / 20%)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    train_split = int(0.8 * len(indices))
+    train_indices = indices[:train_split]
+    val_indices = indices[train_split:]
     
-    # Création des DataLoaders
-    # batch_size: nombre d'images traitées en même temps
-    # shuffle=True: mélange les données à chaque époque (important pour l'entraînement)
+    train_img_paths_split = [train_images_paths[i] for i in train_indices]
+    train_mask_paths_split = [train_masks_paths[i] for i in train_indices]
+    
+    val_img_paths_split = [train_images_paths[i] for i in val_indices]
+    val_mask_paths_split = [train_masks_paths[i] for i in val_indices]
+    
+    # Activation de l'augmentation de données pour le jeu d'entraînement
+    train_dataset = LandCoverDataset(train_img_paths_split, train_mask_paths_split, augment=True)
+    val_dataset = LandCoverDataset(val_img_paths_split, val_mask_paths_split, augment=False)
+    
     BATCH_SIZE = 8
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    print(f"Données prêtes: {len(train_dataset)} images d'entraînement, {len(val_dataset)} images de validation.")
+    print(f"Données prêtes: {len(train_dataset)} images d'entraînement (avec augmentation), {len(val_dataset)} images de validation.")
 
-    # Initialisation du modèle
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Utilisation du device: {device}")
     
@@ -245,38 +259,49 @@ def main():
     
     MODEL_PATH = 'simple_unet_model.pth'
     
+    # Calcul des poids pour gerer le desequilibre des classes
+    print("Calcul des poids des classes...")
+    counts = LandCoverData.TRAIN_CLASS_COUNTS
+    weights = np.zeros(len(counts))
+    
+    # On ignore les classes 0 et 1 (no_data, clouds)
+    valid_classes = [c for c in range(len(counts)) if c not in LandCoverData.IGNORED_CLASSES_IDX]
+    valid_counts = counts[valid_classes]
+    total_valid_pixels = valid_counts.sum()
+    n_valid_classes = len(valid_classes)
+    
+    for i in range(len(counts)):
+        if i in LandCoverData.IGNORED_CLASSES_IDX:
+            weights[i] = 0.0
+        else:
+            # Poids inversement proportionnel a la frequence (avec lissage racine carrée pour éviter l'explosion)
+            # Formule: (N_total / (N_classes * Count_class)) ** 0.5
+            weights[i] = (total_valid_pixels / (n_valid_classes * counts[i])) ** 0.5
+            
+    print(f"Poids des classes (lissés) : {weights}")
+    class_weights = torch.FloatTensor(weights).to(device)
+    
     if Path(MODEL_PATH).exists():
         print(f"Modèle trouvé à '{MODEL_PATH}'. Chargement du modèle existant...")
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     else:
         print("Aucun modèle trouvé. Démarrage de l'entraînement...")
         
-        # Définition de la Loss et de l'Optimizer
-        # CrossEntropyLoss est standard pour la segmentation multi-classes
-        criterion = nn.CrossEntropyLoss()
+        # Utilisation des poids dans la Loss
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
         
-        # Adam est un optimiseur très performant et standard
-        # lr (learning rate) contrôle la vitesse d'apprentissage
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        # Reduced learning rate from 0.001 to 0.0003 for stability
+        optimizer = optim.Adam(model.parameters(), lr=0.0003)
         
-        # Lancement de l'entraînement
-        # Réduction du nombre d'époques à 10 pour un test rapide. 
-        # Augmentez cette valeur pour un entraînement complet.
         model = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10, device=device)
         
-        # Sauvegarde du modèle
         torch.save(model.state_dict(), MODEL_PATH)
         print(f"Modèle sauvegardé sous '{MODEL_PATH}'")
 
-    # Calcul et affichage de la KL Divergence sur le jeu de validation
-    # avg_kl_div = evaluate_kl_divergence(model, val_loader, device)
-    # print(f"KL Divergence moyenne sur le jeu de validation: {avg_kl_div:.4f}")
 
-    # Visualisation des résultats
     print("Visualisation sur le jeu de validation (avec vérité terrain) :")
     predict_and_visualize(model, val_dataset, device)
 
-    # Visualisation sur le jeu de test (sans vérité terrain)
     if len(test_images_paths) > 0:
         print("Visualisation sur le jeu de test (sans vérité terrain) :")
         test_dataset = LandCoverDataset(test_images_paths)

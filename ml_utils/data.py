@@ -1,5 +1,6 @@
 from pathlib import Path
 import numpy as np
+import random
 from tifffile import TiffFile
 from tqdm import tqdm
 import torch
@@ -65,10 +66,11 @@ class LandCoverDataset(Dataset):
     """
     Custom PyTorch Dataset for Land Cover images.
     """
-    def __init__(self, image_paths, mask_paths=None, transform=None):
+    def __init__(self, image_paths, mask_paths=None, transform=None, augment=False):
         self.image_paths = image_paths
         self.mask_paths = mask_paths
         self.transform = transform
+        self.augment = augment
 
     def __len__(self):
         return len(self.image_paths)
@@ -78,15 +80,48 @@ class LandCoverDataset(Dataset):
         img_path = self.image_paths[idx]
         image = get_array_from_path(img_path)
         
+        mask = None
+        if self.mask_paths:
+            mask_path = self.mask_paths[idx]
+            mask = get_array_from_path(mask_path)
+        
+        # Apply data augmentation if enabled
+        if self.augment:
+            # Random Horizontal Flip
+            if random.random() > 0.5:
+                image = np.flip(image, axis=1)
+                if mask is not None:
+                    mask = np.flip(mask, axis=1)
+            
+            # Random Vertical Flip
+            if random.random() > 0.5:
+                image = np.flip(image, axis=0)
+                if mask is not None:
+                    mask = np.flip(mask, axis=0)
+            
+            # Random Rotation (0, 90, 180, 270 degrees)
+            k = random.randint(0, 3)
+            if k > 0:
+                image = np.rot90(image, k=k, axes=(0, 1))
+                if mask is not None:
+                    mask = np.rot90(mask, k=k, axes=(0, 1))
+            
+            # Ensure contiguous array after flips/rotations for torch compatibility
+            image = np.ascontiguousarray(image)
+            if mask is not None:
+                mask = np.ascontiguousarray(mask)
+
+        # Normalization (Simple min-max scaling approximation)
+        # Values are typically 0-2000, max is ~24000. Clipping at 3000 covers most useful info.
+        image = np.clip(image / 3000.0, 0, 1)
+
         # Convert to float32 and normalize if needed (here we keep raw values or normalize)
         # PyTorch expects (C, H, W), but loaded image is (H, W, C)
         image = image.astype(np.float32)
         image = np.transpose(image, (2, 0, 1)) # HWC -> CHW
         image = torch.from_numpy(image)
 
-        if self.mask_paths:
-            mask_path = self.mask_paths[idx]
-            mask = get_array_from_path(mask_path)
+        if mask is not None:
             # Mask is (H, W), PyTorch CrossEntropyLoss expects (H, W) with long type
             mask = mask.astype(np.int64)
             mask = torch.from_numpy(mask)
