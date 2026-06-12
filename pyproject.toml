@@ -1,0 +1,15 @@
+[project]
+name = "simple-unet-satellite-segmentation"
+version = "0.1.0"
+description = "Compact PyTorch U-Net workflow for satellite land-cover segmentation"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.3.5",
+    "pillow>=12.0.0",
+    "pyqt5>=5.15.11",
+    "pyside2>=5.15.2.1",
+    "torch>=2.9.1",
+    "tqdm>=4.67.1",
+]
