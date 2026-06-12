@@ -1,6 +1,6 @@
-# ENS Challenge Data 2021 : Land cover predictive modeling from satellite images
+# Simple U-Net Portfolio Project : Satellite Land Cover Segmentation
 
-This repository stores the code for the benchmark model of the Challenge Data competition [“Land cover predictive modeling from satellite images”](https://challengedata.ens.fr/challenges/48) provided by Preligens.
+This repository contains a portfolio-ready implementation of the benchmark model from the Challenge Data competition [“Land cover predictive modeling from satellite images”](https://challengedata.ens.fr/challenges/48) provided by Preligens.
 The proposed benchmark model is a deep neural network trained on the “proxy” task of semantic segmentation of the land cover labels at the pixel level. The network has a U-Net architecture ([Ronneberger et al 2015](https://arxiv.org/abs/1505.04597)).
 
 ## Data folder
